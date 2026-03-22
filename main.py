@@ -1,22 +1,15 @@
 """
 main.py — IDSaaS Experiment Runner
 
-This is the central file for running experiments.
-Change EXPERIMENT near the top to switch between modes.
+Configure your pipeline using the toggles below.
+The pipeline assembles itself from whatever you enable.
 
-Available experiments:
-  "test_no_dedup"     — process all events without deduplication
-  "test_exact_hash"   — deduplicate using ExactHashCache only
-  "test_bloom_exact"  — deduplicate using BloomFilter + ExactHashCache
-  "test_lstm_only"    — run LSTM detector (stub returns 0.0 until model loaded)
-  "test_signature_only" — run rule-based signature detector
-  "test_hybrid"       — run HybridDetector (signature + LSTM combined)
+─────────────────────────────────────────────
+ PIPELINE CONFIGURATION  ← edit here
+─────────────────────────────────────────────
 """
 
-import sys
-import os
-
-# ── Add src/ to path so you can run: python main.py ─────────────────────────
+import sys, os, json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from bloom import BloomFilter
@@ -25,143 +18,115 @@ from dedup import DedupEngine
 from lstm_detector import LSTMDetector
 from signature_detector import SignatureDetector
 from hybrid_detector import HybridDetector
-from metrics import Timer, classification_report, print_report
+from metrics import classification_report, Timer, print_report
 
+# ── Toggle components on/off ──────────────────────────────────────────────────
+USE_BLOOM      = True   # Bloom filter pre-check before exact cache
+USE_EXACT_HASH = True   # Exact hash cache deduplication
+USE_SIGNATURE  = True   # Rule-based signature detection
+USE_LSTM       = False  # LSTM anomaly detection (stub until model is trained)
 
+# ── Tuning parameters ─────────────────────────────────────────────────────────
+BLOOM_CAPACITY    = 100_000
+BLOOM_ERROR_RATE  = 0.01
+CACHE_MAX_SIZE    = 50_000
+LSTM_THRESHOLD    = 0.5
+N_EVENTS          = 2000
+DUPLICATE_RATIO   = 0.35
 # ─────────────────────────────────────────────────────────────────────────────
-# CHANGE THIS to switch experiments
-EXPERIMENT = "test_bloom_exact"
-# ─────────────────────────────────────────────────────────────────────────────
 
 
-# --- Synthetic Event Generator -----------------------------------------------
+def build_pipeline():
+    """Assemble the pipeline from the toggles above."""
+
+    # Dedup strategy
+    if USE_BLOOM and USE_EXACT_HASH:
+        dedup_strategy = "bloom_exact"
+    elif USE_EXACT_HASH:
+        dedup_strategy = "exact"
+    else:
+        dedup_strategy = "none"
+
+    dedup = DedupEngine(
+        strategy=dedup_strategy,
+        bloom_capacity=BLOOM_CAPACITY,
+        bloom_error_rate=BLOOM_ERROR_RATE,
+        cache_max_size=CACHE_MAX_SIZE,
+    )
+
+    # Detectors
+    sig  = SignatureDetector() if USE_SIGNATURE else None
+    lstm = LSTMDetector(threshold=LSTM_THRESHOLD) if USE_LSTM else None
+
+    label = (
+        f"{'Bloom+' if USE_BLOOM else ''}"
+        f"{'ExactHash+' if USE_EXACT_HASH else ''}"
+        f"{'Signature+' if USE_SIGNATURE else ''}"
+        f"{'LSTM' if USE_LSTM else ''}"
+    ).strip("+") or "No components"
+
+    return dedup, sig, lstm, label
+
+
 def make_events(n=1000, duplicate_ratio=0.3):
-    """
-    Generate synthetic network events as dicts.
-    `duplicate_ratio` controls what fraction are exact duplicates.
-    y_true labels: 0=normal, 1=attack (alternating pattern for demo).
-    """
-    import random, json
-    events, labels = [], []
-    base_events = [
-        {"src_ip": f"10.0.0.{i}", "dst_port_count": random.randint(1, 50),
-         "bytes_per_sec": random.randint(0, 2_000_000), "protocol": "TCP"}
+    import random
+    base = [
+        {
+            "src_ip": f"10.0.0.{i % 255}",
+            "dst_port_count": random.randint(1, 50),
+            "bytes_per_sec": random.randint(0, 2_000_000),
+            "protocol": random.choice(["TCP", "UDP", "IRC"]),
+        }
         for i in range(int(n * (1 - duplicate_ratio)))
     ]
+    events, labels = [], []
     for i in range(n):
-        event = base_events[i % len(base_events)]
-        events.append(event)
-        labels.append(1 if i % 7 == 0 else 0)  # synthetic ground truth
+        events.append(base[i % len(base)])
+        labels.append(1 if i % 7 == 0 else 0)
     return events, labels
 
 
-def event_str(e: dict) -> str:
-    import json
-    return json.dumps(e, sort_keys=True)
-
-
-# --- Experiment Runners -------------------------------------------------------
-
-def test_no_dedup(events, labels):
+def run(events, labels, dedup, sig, lstm):
     timer = Timer()
     preds = []
-    sig = SignatureDetector()
     timer.start()
-    for e in events:
-        r = sig.detect(e)
-        preds.append(1 if r["matched"] else 0)
-    timer.stop()
-    print_report("No Dedup + Signature", classification_report(labels, preds), timer.summary(len(events)))
 
+    for event in events:
+        payload = json.dumps(event, sort_keys=True)
 
-def test_exact_hash(events, labels):
-    dedup = DedupEngine(strategy="exact")
-    timer = Timer()
-    sig = SignatureDetector()
-    preds, seen = [], 0
-    timer.start()
-    for e, lbl in zip(events, labels):
-        if dedup.is_duplicate(event_str(e)):
-            preds.append(0)  # skipped = assume normal
+        # Dedup stage
+        if dedup.is_duplicate(payload):
+            preds.append(0)  # skipped — treated as normal
             continue
-        seen += 1
-        r = sig.detect(e)
-        preds.append(1 if r["matched"] else 0)
+
+        alert = False
+
+        # Signature stage
+        if sig:
+            result = sig.detect(event)
+            alert = alert or result["matched"]
+
+        # LSTM stage
+        if lstm:
+            alert = alert or lstm.is_anomaly([])  # pass real features here later
+
+        preds.append(1 if alert else 0)
+
     timer.stop()
-    print(f"  [ExactHash] Processed {seen}/{len(events)} unique events. Dedup stats: {dedup.stats()}")
-    print_report("Exact Hash Dedup + Signature", classification_report(labels, preds), timer.summary(len(events)))
+    return preds, timer
 
-
-def test_bloom_exact(events, labels):
-    dedup = DedupEngine(strategy="bloom_exact")
-    timer = Timer()
-    sig = SignatureDetector()
-    preds, seen = [], 0
-    timer.start()
-    for e, lbl in zip(events, labels):
-        if dedup.is_duplicate(event_str(e)):
-            preds.append(0)
-            continue
-        seen += 1
-        r = sig.detect(e)
-        preds.append(1 if r["matched"] else 0)
-    timer.stop()
-    print(f"  [BloomExact] Processed {seen}/{len(events)} unique events. Dedup stats: {dedup.stats()}")
-    print_report("Bloom+Exact Dedup + Signature", classification_report(labels, preds), timer.summary(len(events)))
-
-
-def test_lstm_only(events, labels):
-    lstm = LSTMDetector(threshold=0.5)
-    timer = Timer()
-    preds = []
-    timer.start()
-    for e in events:
-        score = lstm.detect([])  # placeholder — no real features yet
-        preds.append(1 if lstm.is_anomaly([]) else 0)
-    timer.stop()
-    print_report("LSTM Only (stub)", classification_report(labels, preds), timer.summary(len(events)))
-
-
-def test_signature_only(events, labels):
-    sig = SignatureDetector()
-    timer = Timer()
-    preds = []
-    timer.start()
-    for e in events:
-        r = sig.detect(e)
-        preds.append(1 if r["matched"] else 0)
-    timer.stop()
-    print_report("Signature Only", classification_report(labels, preds), timer.summary(len(events)))
-
-
-def test_hybrid(events, labels):
-    hybrid = HybridDetector()
-    timer = Timer()
-    preds = []
-    timer.start()
-    for e in events:
-        r = hybrid.detect(event=e, sequence=[])
-        preds.append(1 if r["alert"] else 0)
-    timer.stop()
-    print_report("Hybrid (Signature + LSTM stub)", classification_report(labels, preds), timer.summary(len(events)))
-
-
-# --- Dispatch ----------------------------------------------------------------
-
-EXPERIMENTS = {
-    "test_no_dedup": test_no_dedup,
-    "test_exact_hash": test_exact_hash,
-    "test_bloom_exact": test_bloom_exact,
-    "test_lstm_only": test_lstm_only,
-    "test_signature_only": test_signature_only,
-    "test_hybrid": test_hybrid,
-}
 
 if __name__ == "__main__":
-    print(f"\n[IDSaaS] Running experiment: {EXPERIMENT}")
-    events, labels = make_events(n=2000, duplicate_ratio=0.35)
-    fn = EXPERIMENTS.get(EXPERIMENT)
-    if fn is None:
-        print(f"Unknown experiment: {EXPERIMENT!r}. Choose from: {list(EXPERIMENTS)}")
-        sys.exit(1)
-    fn(events, labels)
+    dedup, sig, lstm, label = build_pipeline()
+
+    print(f"\n[IDSaaS] Pipeline: {label}")
+    print(f"  bloom={USE_BLOOM}  exact_hash={USE_EXACT_HASH}  "
+          f"signature={USE_SIGNATURE}  lstm={USE_LSTM}\n")
+
+    events, labels = make_events(n=N_EVENTS, duplicate_ratio=DUPLICATE_RATIO)
+    preds, timer = run(events, labels, dedup, sig, lstm)
+
+    det = classification_report(labels, preds)
+    sys._metrics = timer.summary(len(events))
+    print_report(label, det, timer.summary(len(events)))
+    print(f"  Dedup stats: {dedup.stats()}\n")
